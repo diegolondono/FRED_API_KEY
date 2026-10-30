@@ -1,0 +1,73 @@
+name: Test FRED API connection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-fred:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Verify registered key and market series
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import math
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          key = os.environ.get("FRED_API_KEY", "").strip()
+          if not key:
+              print("FAIL: FRED_API_KEY is missing or unavailable to this workflow.")
+              sys.exit(1)
+          series = [
+              "MORTGAGE30US", "ACTLISCOU12101", "NEWLISCOU12101",
+              "MEDLISPRI12101", "MEDDAYONMAR12101", "PRIREDCOU12101",
+          ]
+          failed = False
+          for series_id in series:
+              query = urllib.parse.urlencode({
+                  "series_id": series_id,
+                  "api_key": key,
+                  "file_type": "json",
+                  "sort_order": "desc",
+                  "limit": 12,
+              })
+              url = "https://api.stlouisfed.org/fred/series/observations?" + query
+              try:
+                  request = urllib.request.Request(url, headers={
+                      "Accept": "application/json",
+                      "User-Agent": "FloridaPropertyMarketWatch/0.1",
+                  })
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      data = json.load(response)
+                  observations = data.get("observations", [])
+                  valid = []
+                  for item in observations:
+                      try:
+                          if math.isfinite(float(item.get("value", "."))):
+                              valid.append(item)
+                      except (ValueError, TypeError):
+                          pass
+                  if not valid:
+                      raise ValueError("No usable observations")
+                  print(f"PASS: {series_id} — usable observations received.")
+              except urllib.error.HTTPError as error:
+                  # Never print the URL, response body, key, or exception text.
+                  print(f"FAIL: {series_id} — HTTP {error.code}.")
+                  failed = True
+              except Exception:
+                  print(f"FAIL: {series_id} — request or data validation failed.")
+                  failed = True
+          print("This checks FRED access only; it does not configure ChatGPT Sites.")
+          sys.exit(1 if failed else 0)
+          PY
