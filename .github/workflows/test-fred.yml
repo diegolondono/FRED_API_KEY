@@ -1,4 +1,4 @@
-name: Refresh FRED market snapshot
+name: Refresh property market snapshots
 
 on:
   workflow_dispatch:
@@ -88,3 +88,127 @@ jobs:
           path: fred-market-snapshot.json
           retention-days: 7
           if-no-files-found: error
+
+  retrieve-rentcast:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Retrieve RentCast records and active listings
+        env:
+          RENTCAST_API_KEY: ${{ secrets.RENTCAST_API_KEY }}
+          PROPERTY_ADDRESS: ${{ secrets.PROPERTY_ADDRESS }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import math
+          import os
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+          
+          key = os.environ.get("RENTCAST_API_KEY", "").strip()
+          if not key:
+              print("FAIL: RENTCAST_API_KEY is missing or unavailable.")
+              sys.exit(1)
+          
+          now = datetime.now(timezone.utc).isoformat()
+          filters = {
+              "zipCode": "34638", "propertyType": "Single Family",
+              "bedrooms": "5:6", "squareFootage": "2800:3800",
+              "limit": 100, "offset": 0, "includeTotalCount": "true",
+          }
+          fields = [
+              "id", "formattedAddress", "city", "state", "zipCode", "county",
+              "latitude", "longitude", "propertyType", "bedrooms", "bathrooms",
+              "squareFootage", "lotSize", "yearBuilt", "assessorID", "subdivision",
+              "lastSaleDate", "lastSalePrice", "status", "price",
+              "listedDate", "removedDate", "lastSeenDate", "daysOnMarket",
+          ]
+          output = {
+              "schema_version": 1, "retrieved_at": now,
+              "repository": os.environ.get("GITHUB_REPOSITORY"),
+              "run_id": os.environ.get("GITHUB_RUN_ID"),
+              "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT"),
+              "provider": "RentCast",
+              "scope": "ZIP 34638; not restricted to Concord Station",
+              "notes": [
+                  "Provider-reported sale history requires independent verification.",
+                  "Active listing prices are asking prices, not closed-sale evidence.",
+                  "One page per search, capped at 100 records; coverage is not guaranteed.",
+                  "Missing pool data means unknown, not no pool.",
+              ],
+              "datasets": {},
+          }
+          failed = False
+          queries = [
+              ("recent_sale_candidates", "/properties", dict(filters, saleDateRange="*:180")),
+              ("active_listings", "/listings/sale", dict(filters, status="Active")),
+          ]
+          address = os.environ.get("PROPERTY_ADDRESS", "").strip()
+          if address:
+              queries.append(("subject_property", "/properties", {"address": address}))
+          
+          def sanitize(row):
+              result = {k: row[k] for k in fields if k in row}
+              features = row.get("features")
+              if isinstance(features, dict):
+                  result["features"] = {k: features[k] for k in
+                      ["pool", "poolType", "garage", "garageSpaces"] if k in features}
+              history = row.get("history")
+              if isinstance(history, dict):
+                  result["history"] = {
+                      str(k): {f: v[f] for f in ["event", "date", "price"]
+                               if f in v}
+                      for k, v in history.items() if isinstance(v, dict)
+                  }
+              return result
+          
+          for name, path, params in queries:
+              source = "https://api.rentcast.io/v1" + path
+              entry = {"source": source, "query": {k:v for k,v in params.items() if k != "address"},
+                       "retrieved_at": now}
+              try:
+                  request = urllib.request.Request(
+                      source + "?" + urllib.parse.urlencode(params),
+                      headers={"Accept": "application/json", "X-Api-Key": key},
+                  )
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      rows = json.load(response)
+                      total = response.headers.get("X-Total-Count")
+                  if not isinstance(rows, list) or not all(isinstance(x, dict) for x in rows):
+                      raise ValueError("Unexpected response")
+                  entry.update(status="available" if rows else "no_results",
+                               count=len(rows), records=[sanitize(x) for x in rows],
+                               may_be_truncated=len(rows) >= int(params.get("limit", 500)),
+                               total_matching=int(total) if total and total.isdigit() else None)
+                  print(f"PASS: {name}: {len(rows)} records received.")
+              except urllib.error.HTTPError as error:
+                  entry.update(status="unavailable", http_status=error.code)
+                  print(f"FAIL: {name}: HTTP {error.code}.")
+                  failed = True
+              except Exception:
+                  entry.update(status="unavailable", reason="Request or response validation failed")
+                  print(f"FAIL: {name}: request or response validation failed.")
+                  failed = True
+              output["datasets"][name] = entry
+          
+          if not address:
+              output["subject_property_status"] = "Optional PROPERTY_ADDRESS secret not configured"
+          Path("rentcast-property-snapshot.json").write_text(
+              json.dumps(output, indent=2, allow_nan=False))
+          print("Export excludes API keys, owner names, contact details and mailing addresses.")
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Save RentCast data and availability report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rentcast-property-snapshot
+          path: rentcast-property-snapshot.json
+          retention-days: 7
+          if-no-files-found: warn
