@@ -1,7 +1,10 @@
-name: Test FRED API connection
+name: Refresh FRED market snapshot
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/test-fred.yml'
 
 permissions:
   contents: read
@@ -21,6 +24,8 @@ jobs:
           import math
           import os
           import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -34,6 +39,7 @@ jobs:
               "MEDLISPRI12101", "MEDDAYONMAR12101", "PRIREDCOU12101",
           ]
           failed = False
+          snapshot = {"retrieved_at": datetime.now(timezone.utc).isoformat(), "series": {}}
           for series_id in series:
               query = urllib.parse.urlencode({
                   "series_id": series_id,
@@ -60,6 +66,7 @@ jobs:
                           pass
                   if not valid:
                       raise ValueError("No usable observations")
+                  snapshot["series"][series_id] = {"observations": [{"date": x["date"], "value": float(x["value"])} for x in valid], "source": "https://fred.stlouisfed.org/series/" + series_id}
                   print(f"PASS: {series_id} — usable observations received.")
               except urllib.error.HTTPError as error:
                   # Never print the URL, response body, key, or exception text.
@@ -68,6 +75,16 @@ jobs:
               except Exception:
                   print(f"FAIL: {series_id} — request or data validation failed.")
                   failed = True
-          print("This checks FRED access only; it does not configure ChatGPT Sites.")
+          if not failed:
+              Path("fred-market-snapshot.json").write_text(json.dumps(snapshot, indent=2))
+          print("Market snapshot export complete." if not failed else "Snapshot not exported because a series failed.")
           sys.exit(1 if failed else 0)
           PY
+
+      - name: Save dated market snapshot
+        uses: actions/upload-artifact@v4
+        with:
+          name: fred-market-snapshot
+          path: fred-market-snapshot.json
+          retention-days: 7
+          if-no-files-found: error
